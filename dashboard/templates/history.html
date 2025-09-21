@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Simple IDS – Incident History</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+    <style>
+      .history-card {
+        border-left: 4px solid var(--pico-primary);
+        padding-left: 1rem;
+        margin-bottom: 1rem;
+      }
+      .history-card header {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+      .history-card .severity-pill {
+        font-size: 0.75rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        background: var(--pico-muted-border-color);
+        color: var(--pico-muted-color);
+      }
+      .history-card.severity-high {
+        border-left-color: #e53935;
+      }
+      .history-card.severity-high .severity-pill {
+        background: rgba(229, 57, 53, 0.15);
+        color: #b71c1c;
+      }
+      .history-card.severity-medium {
+        border-left-color: #fb8c00;
+      }
+      .history-card.severity-medium .severity-pill {
+        background: rgba(251, 140, 0, 0.15);
+        color: #e65100;
+      }
+      .history-card.severity-low {
+        border-left-color: #43a047;
+      }
+      .history-card.severity-low .severity-pill {
+        background: rgba(67, 160, 71, 0.15);
+        color: #1b5e20;
+      }
+      .history-card .meta {
+        font-size: 0.9rem;
+        color: var(--pico-muted-color);
+      }
+      .history-card pre {
+        margin-top: 0.5rem;
+        max-height: 240px;
+        overflow: auto;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Incident History</h1>
+        <p>Review every alert recorded by the proxy. Newest incidents are listed first.</p>
+        <p>
+          <a href="/">⬅ Back to live dashboard</a>
+        </p>
+      </header>
+
+      {% if error %}
+      <article class="contrast">
+        <strong>Could not load history:</strong>
+        <p>{{ error }}</p>
+      </article>
+      {% endif %}
+
+      {% if not events %}
+      <p>No incidents have been recorded yet. Run an attack scenario to generate activity.</p>
+      {% endif %}
+
+      {% for event in events %}
+      {% set severity = (event.severity or 'unknown').lower() %}
+      <article class="history-card severity-{{ severity }}">
+        <header>
+          <strong>{{ event.title or event.attack_type or 'Suspicious activity' }}</strong>
+          <span class="severity-pill">{{ (event.severity or 'unknown') | upper }}</span>
+        </header>
+        <p class="meta">
+          {{ event.timestamp or 'Unknown time' }}
+          {% if event.source_ip %} • From {{ event.source_ip }}{% endif %}
+          {% if event.target %} • Target {{ event.target }}{% endif %}
+        </p>
+        <p>{{ event.explanation or event.summary }}</p>
+        {% if event.remediation %}
+        <p><strong>Suggested fix:</strong> <code>{{ event.remediation }}</code></p>
+        {% endif %}
+        <details>
+          <summary>View raw details</summary>
+          <pre>{{ (event | tojson(indent=2)) }}</pre>
+        </details>
+      </article>
+      {% endfor %}
+    </main>
+  </body>
+</html>

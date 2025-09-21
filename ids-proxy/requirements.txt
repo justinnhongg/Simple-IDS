@@ -1,0 +1,8 @@
+Flask==3.0.3
+Flask-Cors==4.0.0
+gunicorn==22.0.0
+gevent==24.2.1
+pytest==7.4.0
+requests==2.31.0
+# optional: pip install pyahocorasick for faster multi-pattern scanning
+pyahocorasick==1.4.0 ; extra == 'ahocorasick'

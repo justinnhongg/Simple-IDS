@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Simple IDS Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+    <style>
+      .alert-card {
+        border-left: 4px solid var(--pico-primary);
+        padding-left: 1rem;
+        margin-bottom: 1rem;
+      }
+      .alert-card header {
+        display: flex;
+        align-items: center;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+      }
+      .alert-card .severity-pill {
+        font-size: 0.75rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+        padding: 0.2rem 0.6rem;
+        border-radius: 999px;
+        background: var(--pico-muted-border-color);
+        color: var(--pico-muted-color);
+      }
+      .alert-card.severity-high {
+        border-left-color: #e53935;
+      }
+      .alert-card.severity-high .severity-pill {
+        background: rgba(229, 57, 53, 0.15);
+        color: #b71c1c;
+      }
+      .alert-card.severity-medium {
+        border-left-color: #fb8c00;
+      }
+      .alert-card.severity-medium .severity-pill {
+        background: rgba(251, 140, 0, 0.15);
+        color: #e65100;
+      }
+      .alert-card.severity-low {
+        border-left-color: #43a047;
+      }
+      .alert-card.severity-low .severity-pill {
+        background: rgba(67, 160, 71, 0.15);
+        color: #1b5e20;
+      }
+      .alert-card .alert-meta {
+        font-size: 0.9rem;
+        color: var(--pico-muted-color);
+        margin-bottom: 0.25rem;
+      }
+      .alert-card .alert-actions {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.5rem;
+        margin-top: 0.75rem;
+      }
+      .alert-card .alert-actions a {
+        display: inline-flex;
+        align-items: center;
+      }
+      .alert-card details {
+        margin-top: 0.75rem;
+      }
+      .alert-context {
+        margin-top: 0.5rem;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>Simple IDS Dashboard</h1>
+        <p>
+          This dashboard polls the IDS proxy every {{ refresh_seconds }} seconds and translates the
+          detections into plain language so anyone can follow along.
+        </p>
+        <p>
+          <a href="/health">View health &amp; metrics</a> ·
+          <a href="/history">Incident history</a>
+        </p>
+      </header>
+
+      <section>
+        <h2>Detected Incidents</h2>
+        <div id="error" role="alert" style="display: none" class="contrast"></div>
+        <div id="empty-state" style="display: none">
+          <p>No suspicious activity has been spotted yet. Launch the attack simulator to generate data.</p>
+        </div>
+        <article id="events"></article>
+      </section>
+
+      <section>
+        <h2>Top Offenders</h2>
+        <div id="top-offenders">Loading top offenders...</div>
+      </section>
+
+      <section>
+        <h2>Run Attack Scenarios</h2>
+        <form id="attack-form">
+          <fieldset role="group">
+            <label><input type="checkbox" name="scenarios" value="bruteforce" checked /> Brute force</label>
+            <label><input type="checkbox" name="scenarios" value="sql" checked /> SQL injection</label>
+            <label><input type="checkbox" name="scenarios" value="portscan" checked /> Port scan</label>
+          </fieldset>
+          <label>Pace (1.0 = default)
+            <input type="range" name="pace" id="attack-pace" min="0.2" max="3" step="0.1" value="1" />
+            <span id="attack-pace-value">1.0x</span>
+          </label>
+          <button type="submit">Trigger selected scenarios</button>
+        </form>
+        <div id="attack-feedback" class="secondary"></div>
+        <article id="attack-history"></article>
+      </section>
+
+      <section>
+        <h2>How to run the demo</h2>
+        <ol>
+          <li>Ensure Docker Desktop is running, then launch the stack with <code>make up</code> (or <code>make all</code> to build, start, and run attacks).</li>
+          <li>Wait for the health checks in the terminal to go green; services will expose ports 3000, 5000, and 8000 locally.</li>
+          <li>Visit <code>http://localhost:3000</code> to view this dashboard once the stack is up.</li>
+          <li>Re-run scenarios from the **Run Attack Scenarios** panel or via <code>make attack</code>; tear everything down with <code>make down</code>.</li>
+        </ol>
+      </section>
+    </main>
+    <script>
+      const contextCache = new Map();
+      const CONTEXT_CACHE_TTL_MS = 15000;
+      const eventsState = [];
+      const eventIds = new Set();
+      const EVENT_LIMIT = 200;
+
+      const errorBox = document.getElementById('error');
+      const emptyState = document.getElementById('empty-state');
+      const eventsContainer = document.getElementById('events');
+
+      const ACTION_MUTE_SECONDS = 300;
+
+      function severityClass(severity) {
+        return (typeof severity === 'string' ? severity : 'unknown').toLowerCase();
+      }
+
+      function formatTimestamp(value) {
+        if (!value) return 'Unknown time';
+        try {
+          return new Date(value).toLocaleString();
+        } catch (err) {
+          return value;
+        }
+      }
+
+      async function sendMute(ip, durationSeconds = ACTION_MUTE_SECONDS) {
+        if (!ip) {
+          throw new Error('IP address missing');
+        }
+        const response = await fetch('/api/mute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ip, duration: durationSeconds }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.message || response.statusText || 'Mute failed');
+        }
+        return payload;
+      }
+
+      async function copyRemediation(remediationText) {
+        if (!remediationText) {
+          throw new Error('Nothing to copy');
+        }
+        if (navigator.clipboard?.writeText) {
+          await navigator.clipboard.writeText(remediationText);
+          return true;
+        }
+        const textarea = document.createElement('textarea');
+        textarea.value = remediationText;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        if (!ok) {
+          throw new Error('Clipboard unsupported');
+        }
+        return true;
+      }
+
+      function renderEvents() {
+        if (eventsState.length === 0) {
+          emptyState.style.display = 'block';
+          eventsContainer.replaceChildren();
+          return;
+        }
+
+        emptyState.style.display = 'none';
+        eventsContainer.replaceChildren();
+        eventsState.forEach((event) => {
+          const sourceIp = typeof event.source_ip === 'string' ? event.source_ip : '';
+          const severity = severityClass(event.severity);
+
+          const card = document.createElement('article');
+          card.className = `alert-card severity-${severity}`;
+
+          const header = document.createElement('header');
+          const title = document.createElement('strong');
+          title.textContent = event.title || event.attack_type || 'Suspicious activity';
+          header.append(title);
+
+          const severityPill = document.createElement('span');
+          severityPill.className = `severity-pill severity-${severity}`;
+          severityPill.textContent = (event.severity || 'unknown').toUpperCase();
+          header.append(severityPill);
+          card.append(header);
+
+          const meta = document.createElement('p');
+          meta.className = 'alert-meta';
+          const metaPieces = [];
+          if (sourceIp) {
+            metaPieces.push(`From ${sourceIp}`);
+          }
+          if (event.target) {
+            metaPieces.push(`Target ${event.target}`);
+          }
+          metaPieces.push(formatTimestamp(event.timestamp));
+          meta.textContent = metaPieces.join(' • ');
+          card.append(meta);
+
+          const explanation = document.createElement('p');
+          explanation.textContent = event.explanation || event.summary || 'Suspicious activity detected.';
+          card.append(explanation);
+
+          if (event.remediation) {
+            const remediation = document.createElement('p');
+            const label = document.createElement('strong');
+            label.textContent = 'Suggested fix: ';
+            remediation.append(label);
+            const code = document.createElement('code');
+            code.textContent = event.remediation;
+            remediation.append(code);
+            card.append(remediation);
+          }
+
+          const actions = document.createElement('div');
+          actions.className = 'alert-actions';
+
+          if (sourceIp) {
+            const muteButton = document.createElement('button');
+            muteButton.type = 'button';
+            muteButton.textContent = 'Mute IP 5m';
+            muteButton.addEventListener('click', async () => {
+              const original = muteButton.textContent;
+              muteButton.disabled = true;
+              try {
+                await sendMute(sourceIp, ACTION_MUTE_SECONDS);
+                muteButton.textContent = 'Muted ✓';
+              } catch (err) {
+                console.error('Mute failed', err);
+                muteButton.textContent = 'Mute failed';
+              }
+              setTimeout(() => {
+                muteButton.textContent = original;
+                muteButton.disabled = false;
+              }, 2500);
+            });
+            actions.append(muteButton);
+          }
+
+          if (event.remediation) {
+            const copyButton = document.createElement('button');
+            copyButton.type = 'button';
+            copyButton.textContent = 'Copy fix';
+            copyButton.addEventListener('click', async () => {
+              const original = copyButton.textContent;
+              copyButton.disabled = true;
+              try {
+                await copyRemediation(event.remediation);
+                copyButton.textContent = 'Copied ✓';
+              } catch (err) {
+                console.error('Copy failed', err);
+                copyButton.textContent = 'Copy failed';
+              }
+              setTimeout(() => {
+                copyButton.textContent = original;
+                copyButton.disabled = false;
+              }, 2000);
+            });
+            actions.append(copyButton);
+          }
+
+          if (event.id) {
+            const exportLink = document.createElement('a');
+            exportLink.href = `/api/export/${encodeURIComponent(event.id)}`;
+            exportLink.textContent = 'Export JSON';
+            exportLink.setAttribute('download', `${event.id}.json`);
+            actions.append(exportLink);
+          }
+
+          card.append(actions);
+
+          if (sourceIp) {
+            const contextWrapper = document.createElement('div');
+            contextWrapper.className = 'alert-context';
+            const contextButton = document.createElement('button');
+            contextButton.type = 'button';
+            contextButton.textContent = 'Show recent context';
+            const contextContainer = document.createElement('div');
+            contextContainer.style.marginTop = '0.5rem';
+            contextButton.addEventListener('click', () => showContext(sourceIp, contextContainer));
+            contextWrapper.append(contextButton);
+            contextWrapper.append(contextContainer);
+            card.append(contextWrapper);
+          }
+
+          const rawDetails = document.createElement('details');
+          const rawSummary = document.createElement('summary');
+          rawSummary.textContent = 'View raw fields';
+          rawDetails.append(rawSummary);
+          const pre = document.createElement('pre');
+          pre.textContent = JSON.stringify(
+            {
+              details: event.details ?? {},
+              meta: event.meta ?? {},
+            },
+            null,
+            2,
+          );
+          rawDetails.append(pre);
+          card.append(rawDetails);
+
+          eventsContainer.append(card);
+        });
+      }
+
+      function setEvents(initialEvents) {
+        eventIds.clear();
+        eventsState.splice(0, eventsState.length);
+        initialEvents.forEach((event) => {
+          if (!event || !event.id || eventIds.has(event.id)) return;
+          eventIds.add(event.id);
+          eventsState.push(event);
+        });
+        renderEvents();
+      }
+
+      function prependEvent(event) {
+        if (!event || !event.id || eventIds.has(event.id)) {
+          return;
+        }
+        eventIds.add(event.id);
+        eventsState.unshift(event);
+        if (eventsState.length > EVENT_LIMIT) {
+          const removed = eventsState.splice(EVENT_LIMIT);
+          removed.forEach((ev) => eventIds.delete(ev.id));
+        }
+        renderEvents();
+      }
+
+      async function fetchEvents() {
+        try {
+          const response = await fetch('/api/events');
+          const payload = await response.json();
+
+          if (!response.ok) {
+            errorBox.style.display = 'block';
+            errorBox.textContent = 'Could not reach the IDS proxy: ' + (payload.error || response.statusText);
+            emptyState.style.display = 'none';
+            eventsContainer.replaceChildren();
+            return;
+          }
+
+          errorBox.style.display = 'none';
+          const events = Array.isArray(payload.events) ? payload.events : [];
+          setEvents(events);
+        } catch (error) {
+          errorBox.style.display = 'block';
+          errorBox.textContent = 'Could not load events: ' + error;
+        }
+      }
+
+      function setupEventStream() {
+        try {
+          const source = new EventSource('/api/events/stream');
+          source.onmessage = (evt) => {
+            if (!evt.data) return;
+            try {
+              const data = JSON.parse(evt.data);
+              prependEvent(data);
+            } catch (err) {
+              console.error('Failed to parse SSE payload', err);
+            }
+          };
+          source.onopen = () => {
+            errorBox.style.display = 'none';
+          };
+          source.onerror = () => {
+            errorBox.style.display = 'block';
+            errorBox.textContent = 'Live updates temporarily disconnected. Attempting to reconnect...';
+          };
+        } catch (err) {
+          console.error('EventSource unsupported', err);
+        }
+      }
+
+      fetchEvents();
+      setupEventStream();
+
+      async function fetchTop() {
+        const el = document.getElementById('top-offenders');
+        try {
+          const response = await fetch('/api/top');
+          const payload = await response.json();
+          if (!response.ok) {
+            el.textContent = 'Could not load top offenders: ' + (payload.error || response.statusText);
+            return;
+          }
+          const top = Array.isArray(payload.top) ? payload.top : [];
+          if (top.length === 0) {
+            el.textContent = 'No top offenders yet.';
+            return;
+          }
+          const list = document.createElement('ol');
+          top.forEach((item) => {
+            const li = document.createElement('li');
+            const source = item.source_ip || 'unknown';
+            const count = typeof item.count === 'number' ? item.count : '?';
+            li.textContent = `${source} — approx ${count} events`;
+            list.append(li);
+          });
+          el.replaceChildren(list);
+        } catch (err) {
+          el.textContent = 'Error loading top offenders: ' + err;
+        }
+      }
+
+      fetchTop();
+
+      function getCachedContext(ip) {
+        const cached = contextCache.get(ip);
+        if (!cached) {
+          return null;
+        }
+        if (cached.expiresAt <= Date.now()) {
+          contextCache.delete(ip);
+          return null;
+        }
+        return cached.data;
+      }
+
+      function renderContext(containerEl, items, ip) {
+        if (!containerEl) {
+          return;
+        }
+        if (!items || items.length === 0) {
+          containerEl.textContent = 'No recent events for ' + ip;
+          return;
+        }
+        const list = document.createElement('ol');
+        items.forEach((it) => {
+          const li = document.createElement('li');
+          const code = document.createElement('code');
+          code.textContent = it.event_type || 'event';
+          li.append(code);
+          const meta = document.createTextNode(' @ ' + (it.timestamp ? new Date(it.timestamp).toLocaleString() : 'unknown time') + ' - ');
+          li.append(meta);
+          const pre = document.createElement('pre');
+          pre.style.display = 'inline';
+          pre.textContent = JSON.stringify(it, null, 2);
+          li.append(pre);
+          list.append(li);
+        });
+        containerEl.replaceChildren(list);
+      }
+
+      async function showContext(ip, containerEl) {
+        if (!containerEl) {
+          return;
+        }
+        const cached = getCachedContext(ip);
+        if (cached) {
+          renderContext(containerEl, cached, ip);
+          return;
+        }
+        containerEl.textContent = 'Loading context...';
+        try {
+          const response = await fetch('/api/context/' + encodeURIComponent(ip));
+          const payload = await response.json();
+          if (!response.ok) {
+            containerEl.textContent = 'Could not load context: ' + (payload.error || response.statusText);
+            return;
+          }
+          const items = Array.isArray(payload.events) ? payload.events : [];
+          contextCache.set(ip, { data: items, expiresAt: Date.now() + CONTEXT_CACHE_TTL_MS });
+          renderContext(containerEl, items, ip);
+        } catch (err) {
+          containerEl.textContent = 'Error loading context: ' + err;
+        }
+      }
+      setInterval(fetchEvents, Math.max({{ refresh_seconds }} * 1000, 60000));
+      setInterval(fetchTop, {{ refresh_seconds }} * 1000);
+
+      const attackForm = document.getElementById('attack-form');
+      if (attackForm) {
+        const paceInput = document.getElementById('attack-pace');
+        const paceValue = document.getElementById('attack-pace-value');
+        const feedback = document.getElementById('attack-feedback');
+
+        paceInput?.addEventListener('input', () => {
+          paceValue.textContent = `${parseFloat(paceInput.value).toFixed(1)}x`;
+        });
+
+        attackForm.addEventListener('submit', async (event) => {
+          event.preventDefault();
+          const selected = Array.from(attackForm.querySelectorAll('input[name="scenarios"]:checked')).map((input) => input.value);
+          const payload = {
+            scenarios: selected,
+            pace: parseFloat(paceInput.value),
+          };
+          feedback.textContent = 'Starting scenarios...';
+          feedback.classList.remove('contrast');
+          try {
+            const response = await fetch('/api/attack', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload),
+            });
+            const body = await response.json();
+            if (!response.ok) {
+              throw new Error(body.message || response.statusText);
+            }
+            feedback.textContent = 'Attack simulator triggered.';
+            refreshAttackStatus();
+          } catch (err) {
+            feedback.textContent = 'Attack simulator error: ' + err;
+            feedback.classList.add('contrast');
+          }
+        });
+      }
+
+      const attackHistoryEl = document.getElementById('attack-history');
+      const attackFeedback = document.getElementById('attack-feedback');
+
+      function renderAttackHistory(runs) {
+        if (!attackHistoryEl) return;
+        const items = (Array.isArray(runs) ? runs : [])
+          .map((run) => {
+            const executed = Array.isArray(run.executed) ? run.executed.join(', ') : 'n/a';
+            const status = run.status || 'completed';
+            return `
+              <article>
+                <header>
+                  <strong>${run.timestamp || 'recent run'}</strong>
+                  <span class="secondary">pace ${run.pace || 1}x</span>
+                </header>
+                <p><small>Status: ${status}</small></p>
+                <p><small>Executed: ${executed} → target ${run.target || '-'}</small></p>
+                <p><small>Duration: ${run.duration_seconds || '?'}s</small></p>
+                ${run.error ? `<p class="contrast">${run.error}</p>` : ''}
+              </article>
+            `;
+          })
+          .join('');
+        attackHistoryEl.innerHTML = items || '<p>No recent runs.</p>';
+      }
+
+      async function refreshAttackStatus() {
+        if (!attackHistoryEl) return;
+        try {
+          const response = await fetch('/api/attack/status');
+          const payload = await response.json();
+          if (!response.ok) {
+            throw new Error(payload.message || response.statusText);
+          }
+          renderAttackHistory(payload.runs || []);
+          if (payload.health && typeof payload.health.running !== 'undefined') {
+            attackFeedback.textContent = payload.health.running ? 'Attack simulator is running…' : 'Attack simulator idle';
+            if (payload.health.running) {
+              attackFeedback.classList.add('secondary');
+            } else {
+              attackFeedback.classList.remove('secondary');
+            }
+          }
+        } catch (err) {
+          attackHistoryEl.innerHTML = '<p class="contrast">Could not load attack history: ' + err + '</p>';
+        }
+      }
+
+      refreshAttackStatus();
+      setInterval(refreshAttackStatus, 15000);
+    </script>
+  </body>
+</html>

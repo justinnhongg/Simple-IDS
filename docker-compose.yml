@@ -1,0 +1,88 @@
+services:
+  ids-proxy:
+    build: ./ids-proxy
+    container_name: simple_ids_proxy
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ids_data:/app/data
+    env_file:
+      - .env.example
+      - .env
+    environment:
+      IDS_PROXY_EVENTS: /app/data/events.json
+      IDS_PROXY_LOG: /app/logs/ids-proxy.log
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    entrypoint: ["/app/entrypoint.sh"]
+
+  demo-app:
+    build: ./demo-app
+    container_name: simple_demo_app
+    restart: unless-stopped
+    ports:
+      - "5001:5000"
+    depends_on:
+      ids-proxy:
+        condition: service_healthy
+    environment:
+      IDS_PROXY_INGEST: http://ids-proxy:8000/ingest
+      DEMO_APP_LOG: /app/logs/demo-app.log
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  dashboard:
+    build: ./dashboard
+    container_name: simple_ids_dashboard
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    depends_on:
+      ids-proxy:
+        condition: service_healthy
+    environment:
+      IDS_PROXY_EVENTS_URL: http://ids-proxy:8000/events
+      IDS_PROXY_TOP_URL: http://ids-proxy:8000/top
+      IDS_PROXY_CONTEXT_URL: http://ids-proxy:8000/context
+      IDS_PROXY_METRICS_URL: http://ids-proxy:8000/metrics
+      IDS_PROXY_EVENTS_STREAM_URL: http://ids-proxy:8000/events/stream
+      ATTACK_SIM_URL: http://attack-sim:9000
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3000/"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  attack-sim:
+    build: ./attack-sim
+    container_name: simple_attack_sim
+    restart: unless-stopped
+    depends_on:
+      demo-app:
+        condition: service_healthy
+      ids-proxy:
+        condition: service_healthy
+      dashboard:
+        condition: service_healthy
+    environment:
+      ATTACK_SIM_MODE: server
+      PORT: 9000
+      ATTACK_SIM_TARGET: http://demo-app:5000
+    ports:
+      - "9000:9000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  ids_data:
+    driver: local

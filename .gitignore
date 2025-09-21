@@ -1,0 +1,6 @@
+*.log
+**/logs/
+ids-proxy/data/events.json
+__pycache__/
+*.pyc
+.env

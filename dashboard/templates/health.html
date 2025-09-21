@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Dashboard Health</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css" />
+    <style>
+      .metric-card { display: flex; flex-direction: column; gap: 0.4rem; padding: 1rem; border: 1px solid var(--muted-border-color); border-radius: 0.5rem; }
+      .metric-value { font-size: 1.6rem; font-weight: 600; }
+      .metric-rate { color: var(--muted-color); font-size: 0.9rem; }
+      .sparkline { width: 120px; height: 40px; }
+      .sparkline path { stroke: var(--primary); stroke-width: 2; fill: none; }
+    </style>
+  </head>
+  <body>
+    <main class="container">
+      <header>
+        <h1>All Systems Go</h1>
+        <p>Live snapshot of detections and attack-simulator readiness.</p>
+      </header>
+
+      <section>
+        <article id="metrics-error" class="contrast" style="display:none"></article>
+        <div id="metrics-grid" class="grid"></div>
+      </section>
+
+      <section>
+        <article id="attack-status" class="secondary"></article>
+      </section>
+
+      <footer>
+        <a href="/">Back to dashboard</a>
+      </footer>
+    </main>
+
+    <script>
+      const metricsGrid = document.getElementById('metrics-grid');
+      const metricsError = document.getElementById('metrics-error');
+      const attackStatus = document.getElementById('attack-status');
+      attackStatus.textContent = 'Loading attack simulator status...';
+      const metricsHistory = new Map();
+      const HISTORY_LIMIT = 30;
+      const HISTORY_MS = 5 * 60 * 1000;
+
+      const initialMetrics = {{ metrics | tojson | safe }};
+      const hadInitialError = {{ 'true' if error else 'false' }};
+
+      if (hadInitialError) {
+        metricsError.style.display = 'block';
+        metricsError.textContent = 'Initial load failed: {{ error }}';
+      } else {
+        updateMetricsView(initialMetrics, Date.now());
+      }
+
+      async function fetchMetrics() {
+        try {
+          const res = await fetch('/api/metrics');
+          const payload = await res.json();
+          if (!res.ok) {
+            throw new Error(payload.error || res.statusText);
+          }
+          metricsError.style.display = 'none';
+          updateMetricsView(payload, Date.now());
+        } catch (err) {
+          metricsError.style.display = 'block';
+          metricsError.textContent = 'Could not refresh metrics: ' + err;
+        }
+      }
+
+      function updateMetricsView(metrics, timestamp) {
+        if (!metrics || typeof metrics !== 'object') {
+          return;
+        }
+
+        Object.entries(metrics).forEach(([key, value]) => {
+          if (typeof value !== 'number') return;
+          const history = metricsHistory.get(key) || [];
+          history.push({ t: timestamp, v: value });
+          while (history.length > HISTORY_LIMIT || (history.length > 1 && timestamp - history[0].t > HISTORY_MS)) {
+            history.shift();
+          }
+          metricsHistory.set(key, history);
+        });
+
+        const cards = Object.keys(metricsHistory)
+          .sort()
+          .map((metric) => {
+            const history = metricsHistory.get(metric) || [];
+            const latest = history.length ? history[history.length - 1].v : 0;
+            const rate = computeRatePerMinute(history);
+            const sparkline = renderSparkline(history.map((point) => point.v));
+            return `
+              <article class="metric-card">
+                <header><code>${metric}</code></header>
+                <strong class="metric-value">${latest}</strong>
+                <div class="metric-rate">${rate !== null ? rate.toFixed(1) + ' / min' : 'Collecting...'}</div>
+                ${sparkline}
+              </article>
+            `;
+          })
+          .join('');
+
+        metricsGrid.innerHTML = cards;
+      }
+
+      function computeRatePerMinute(history) {
+        if (history.length < 2) {
+          return null;
+        }
+        const first = history[0];
+        const last = history[history.length - 1];
+        const delta = last.v - first.v;
+        const elapsed = (last.t - first.t) / 1000; // seconds
+        if (elapsed <= 0) {
+          return null;
+        }
+        return Math.max(0, delta / elapsed * 60);
+      }
+
+      function renderSparkline(values) {
+        if (!values || values.length === 0) {
+          return '<svg class="sparkline"></svg>';
+        }
+        const width = 120;
+        const height = 40;
+        if (values.length === 1) {
+          return `<svg class="sparkline" viewBox="0 0 ${width} ${height}"><line x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}" stroke="var(--muted-border-color)" stroke-width="1" /></svg>`;
+        }
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const range = max - min || 1;
+        const step = width / (values.length - 1);
+        const path = values
+          .map((value, idx) => {
+            const x = idx * step;
+            const y = height - ((value - min) / range) * height;
+            return `${idx === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+          })
+          .join(' ');
+        return `<svg class="sparkline" viewBox="0 0 ${width} ${height}"><path d="${path}" /></svg>`;
+      }
+
+      async function fetchAttackStatus() {
+        try {
+          const res = await fetch('/api/attack/status');
+          const payload = await res.json();
+          if (!res.ok) {
+            throw new Error(payload.message || res.statusText);
+          }
+          const running = payload.health?.running;
+          const runs = payload.runs || [];
+          const headline = running ? 'Attack simulator is running…' : 'Attack simulator idle';
+          const list = runs
+            .slice(0, 3)
+            .map((run) => {
+              const executed = Array.isArray(run.executed) ? run.executed.join(', ') : 'n/a';
+              return `<li>${run.timestamp || 'recent run'} — ${executed} (${run.duration_seconds || '?'}s)</li>`;
+            })
+            .join('');
+          attackStatus.innerHTML = `
+            <h2>${headline}</h2>
+            <ul>${list || '<li>No recent runs.</li>'}</ul>
+          `;
+        } catch (err) {
+          attackStatus.innerHTML = '<p class="contrast">Could not reach attack simulator: ' + err + '</p>';
+        }
+      }
+
+      fetchMetrics();
+      fetchAttackStatus();
+      setInterval(fetchMetrics, 5000);
+      setInterval(fetchAttackStatus, 15000);
+    </script>
+  </body>
+</html>
